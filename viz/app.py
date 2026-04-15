@@ -39,7 +39,13 @@ app = FastAPI(title="MPPI Planner Visualizer")
 VIZ_DIR = Path(__file__).resolve().parent
 STATIC_DIR = VIZ_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
+FRONTEND_DIST = VIZ_DIR / "frontend" / "dist"
 
+# Serve React build assets if available
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+# Fallback: serve old static files
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ---------------------------------------------------------------------------
@@ -141,6 +147,8 @@ def _downsample_grid(grid: np.ndarray, max_dim: int = 100) -> list:
 
 @app.get("/")
 async def index():
+    if FRONTEND_DIST.exists():
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
