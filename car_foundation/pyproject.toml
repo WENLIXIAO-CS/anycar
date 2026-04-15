@@ -1,0 +1,30 @@
+[project]
+name = "car-foundation"
+version = "0.0.1"
+description = "car foundation"
+requires-python = ">=3.10"
+authors = [
+    { name = "Wenli Xiao", email = "wxiao2@andrew.cmu.edu" },
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "casadi",
+    "scipy",
+    "flax",
+    "tqdm",
+    "pykan",
+    "transforms3d",
+    "scikit-learn",
+    "wandb",
+    "transformers",
+    "pytorch-warmup",
+    "orbax-checkpoint==0.5.15",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["car_foundation"]

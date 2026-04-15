@@ -6,7 +6,6 @@ import time
 from termcolor import colored
 from .base import BaseController
 from functools import partial
-from car_dynamics.models_jax import DynamicParams   
 import flax
 from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
 
@@ -35,14 +34,23 @@ class MPPIParams:
     smooth_alpha: float = 0.8
     dynamics: str = 'dbm'
     dual: bool = False
+    # Adaptive covariance (mppi_torch-style)
+    cov_floor: float = 0.0           # kappa: minimum covariance diagonal. 0 = off.
+    # Adaptive temperature (mppi_torch-style)
+    adaptive_beta: bool = False      # enable adaptive temperature tuning
+    beta_eta_upper: float = 100.0    # eta > this → sharpen (fewer effective samples needed)
+    beta_eta_lower: float = 10.0     # eta < this → soften (too few effective samples)
+    beta_shrink: float = 0.9         # multiplier when sharpening
+    beta_grow: float = 1.2           # multiplier when softening
 
 @flax.struct.dataclass
 class MPPIRunningParams:
     a_mean: jnp.ndarray
-    a_cov: jnp.ndarray  
+    a_cov: jnp.ndarray
     prev_a: jnp.ndarray
     state_hist: jnp.ndarray
     key: jax.random.PRNGKey
+    beta: float = 0.05  # adaptive temperature (initialized from params.lam)
 
 def slow_scan(f, init, xs, length=None):
     if xs is None:
@@ -59,13 +67,12 @@ class MPPIController(BaseController):
     def __init__(self,
                 params: MPPIParams, rollout_fn: callable, rollout_start_fn: callable, key):
         """ MPPI implemented in Jax """
-        assert params.gamma_sigma <= 0.
         self.params = params
         self.rollout_fn = rollout_fn
         self.rollout_start_fn = rollout_start_fn
         self._init_buffers()
         
-        if params.dynamics == 'dbm':
+        if params.dynamics in ('dbm', 'scan'):
             self.scan_fn = jax.lax.scan
             self._get_rollout = self._get_rollout_dbm
         elif params.dynamics == 'transformer-jax':
@@ -79,7 +86,8 @@ class MPPIController(BaseController):
         self.spline_order = self.params.spline_order
         self.H = (self.params.h_knot -1 ) * self.params.num_intermediate + 1 
         self.a_mean = jnp.zeros((self.H, self.params.num_actions))
-        sigmas = jnp.array([self.params.sigma] * 2)
+        s = self.params.sigma
+        sigmas = jnp.array(s) if hasattr(s, '__len__') else jnp.array([s] * self.params.num_actions)
         a_cov_per_step = jnp.diag(sigmas ** 2)
         self.a_cov = jnp.tile(a_cov_per_step[None, :, :], (self.H, 1, 1))
         self.a_mean_init = self.a_mean[-1:]
@@ -121,6 +129,7 @@ class MPPIController(BaseController):
             prev_a = self.prev_a,
             key = jax.random.PRNGKey(123),
             state_hist = self.state_hist_init,
+            beta = self.params.lam,
         )
         
     @partial(jax.jit, static_argnums=(0,))
@@ -303,6 +312,7 @@ class MPPIController(BaseController):
             prev_a = param.prev_a,
             state_hist = state_hist,
             key = param.key,
+            beta = param.beta,
         )
     
     @partial(jax.jit, static_argnums=(0,))
@@ -377,8 +387,8 @@ class MPPIController(BaseController):
         a_mean_waypoint = running_params.a_mean[::self.params.num_intermediate]
         
         ## Spline interpolation
-        a_mean_waypoint = a_mean_waypoint.at[:, 0].set(self.u2node(running_params.a_mean[:, 0]))
-        a_mean_waypoint = a_mean_waypoint.at[:, 1].set(self.u2node(running_params.a_mean[:, 1]))
+        for d in range(self.params.num_actions):
+            a_mean_waypoint = a_mean_waypoint.at[:, d].set(self.u2node(running_params.a_mean[:, d]))
         
         
         a_cov_waypoint = running_params.a_cov[::self.params.num_intermediate]
@@ -389,13 +399,13 @@ class MPPIController(BaseController):
     
         ### Spline interpolation
         a_sampled = self.action_sampled.copy()
-        a_sampled = a_sampled.at[:, :, 0].set(self.node2u_vmap(a_sampled_waypoint[:, :, 0]))
-        a_sampled = a_sampled.at[:, :, 1].set(self.node2u_vmap(a_sampled_waypoint[:, :, 1]))
+        for d in range(self.params.num_actions):
+            a_sampled = a_sampled.at[:, :, d].set(self.node2u_vmap(a_sampled_waypoint[:, :, d]))
         
 
         a_sampled_raw = self.normalize_action(a_sampled)
         a_sampled = self.action_init_buf.copy()
-        a_sampled.at[:, :self.params.delay, :].set(running_params.prev_a)
+        a_sampled = a_sampled.at[:, :self.params.delay, :].set(running_params.prev_a)
         a_sampled = a_sampled.at[:, self.params.delay:, :].set(a_sampled_raw)
         
         state_init = self.state_init_buf.copy()
@@ -408,34 +418,85 @@ class MPPIController(BaseController):
         
 
         reward_rollout = self.get_reward(state_list, a_sampled, goal_list)
-        cost_rollout = -reward_rollout
-        cost_exp = jnp.exp(-(cost_rollout - jnp.min(cost_rollout)) / self.params.lam)
-        weight = cost_exp / cost_exp.sum()
 
+        # Sparse goal-reach bonus: position + heading + stopped
+        # Exponential decay: earlier reach = higher reward
+        if hasattr(self, '_grr') and self._grr > 0:
+            goal_pos = goal_list[-1, :2]
+            goal_heading = goal_list[-1, 2]
+            # Position: within threshold
+            dist_to_goal = jnp.linalg.norm(
+                state_list[:, :, :2] - goal_pos[None, None, :], axis=2
+            )  # (H+1, n_rollouts)
+            pos_ok = dist_to_goal < self._grt
+            # Heading: within threshold * 5
+            heading_diff = jnp.abs(jnp.arctan2(
+                jnp.sin(state_list[:, :, 2] - goal_heading),
+                jnp.cos(state_list[:, :, 2] - goal_heading),
+            ))
+            heading_ok = heading_diff < (self._grt * 5.0)
+            # Velocity: must be nearly stopped (no drive-through)
+            if self.params.num_obs >= 4:
+                vel_ok = jnp.abs(state_list[:, :, 3]) < 0.3
+            else:
+                vel_ok = jnp.ones_like(pos_ok)  # no velocity state, skip check
+            reached_mask = pos_ok & heading_ok & vel_ok
+            first_step = jnp.argmax(reached_mask, axis=0)
+            ever_reached = jnp.any(reached_mask, axis=0).astype(jnp.float32)
+            H_float = float(state_list.shape[0] - 1)
+            reward_bonus = ever_reached * self._grr * jnp.exp(-3.0 * first_step / H_float)
+            reward_rollout = reward_rollout + reward_bonus
+
+        cost_rollout = -reward_rollout
+
+        ## Note: 3. Cost weighting with adaptive temperature
+        beta = running_params.beta
+        cost_exp = jnp.exp(-(cost_rollout - jnp.min(cost_rollout)) / beta)
+        eta = jnp.sum(cost_exp)  # effective sample count (partition function)
+        weight = cost_exp / eta
+
+        # Adaptive beta (mppi_torch-style): tune temperature based on eta
+        # Clamp to [lam/10, lam*20] to prevent explosion
+        beta_min = self.params.lam * 0.1
+        beta_max = self.params.lam * 20.0
+        new_beta = jnp.where(
+            self.params.adaptive_beta,
+            jnp.clip(
+                jnp.where(eta > self.params.beta_eta_upper, beta * self.params.beta_shrink,
+                jnp.where(eta < self.params.beta_eta_lower, beta * self.params.beta_grow,
+                beta)),
+                beta_min, beta_max,
+            ),
+            beta,
+        )
 
         a_sampled = a_sampled[:, self.params.delay:, :]
-        
-        ## Note: 3. Evaluating costs for each trajectory
+
+        ## Note: 4. Mean update (weighted average with momentum)
         a_mean = jnp.sum(
             weight[:, None, None] * a_sampled, axis=0
         ) * self.params.gamma_mean + running_params.a_mean * (
             1 - self.params.gamma_mean
         )
 
+        ## Note: 5. Covariance update (adaptive diagonal with floor)
         a_cov = jnp.sum(
                         weight[:, None, None, None] * ((a_sampled - a_mean)[..., None] * (a_sampled - a_mean)[:, :, None, :]),
                         axis=0,
                     ) * self.params.gamma_sigma + running_params.a_cov * (1 - self.params.gamma_sigma)
-        
+
+        # Add covariance floor (kappa) to prevent sigma collapse
+        a_cov = a_cov + self.params.cov_floor * jnp.eye(self.params.num_actions)[None, :, :]
+
         u = a_mean[0]
 
         optim_traj = None
         action_expand = jnp.tile(jnp.expand_dims(a_mean, 0), (self.params.n_rollouts, 1, 1))
-        
+
         self_key, key2 = jax.random.split(self_key, 2)
         optim_traj = jnp.stack(self._get_rollout(key2, state_init, running_params.state_hist, action_expand, dynamic_params_tuple, self.params.fix_history))[:, 0]
-        
-        prev_a = jnp.concatenate([running_params.prev_a[1:], a_mean[:1]], axis=0)         
+
+        prev_a = jnp.concatenate([running_params.prev_a[1:], a_mean[:1]], axis=0)
 
         new_running_params = MPPIRunningParams(
             a_mean = jnp.concatenate([a_mean[1:], a_mean[-1:]], axis=0),
@@ -443,17 +504,24 @@ class MPPIController(BaseController):
             state_hist = running_params.state_hist,
             prev_a = prev_a,
             key = self_key,
+            beta = new_beta,
         )
 
+        # Extract diverse sampled trajectories for visualization
+        # Evenly spaced across cost-sorted rollouts (best → worst)
+        n_viz = 10
+        sorted_indices = jnp.argsort(cost_rollout)
+        step_size = max(self.params.n_rollouts // n_viz, 1)  # static int for JIT
+        viz_indices = sorted_indices[::step_size][:n_viz]
+        # state_list: (H+1, n_rollouts, num_obs)
+        sampled_trajs = state_list[:, viz_indices, :]  # (H+1, n_viz, num_obs)
+
         info_dict = {
-            'trajectory': optim_traj, 
-            'action': None, 
+            'trajectory': optim_traj,
+            'sampled_trajectories': sampled_trajs,
+            'action': None,
             'a_mean_jnp': a_mean,
             'action_candidate': None, 'x_all': None, 'y_all': None,
-            
-            ### Note: Need to comment out the @jax.jit decorator for the following two lines to visualize the history
-            #  'history': running_params.state_hist,
-            #  'all_traj': state_list[:, best_100_idx],
         } 
         
         return u,  new_running_params,  info_dict

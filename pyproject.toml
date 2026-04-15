@@ -1,0 +1,39 @@
+[project]
+name = "anycar"
+version = "0.1.0"
+description = "RC Car Dynamics, Planning, and Control"
+requires-python = ">=3.10"
+authors = [
+    { name = "Wenli Xiao", email = "wxiao2@andrew.cmu.edu" },
+]
+dependencies = [
+    "car-dynamics",
+    "matplotlib>=3.10.8",
+    "fastapi",
+    "uvicorn",
+    "numba>=0.65.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipdb",
+    "pytest",
+]
+
+[tool.uv.workspace]
+members = [
+    "car_dynamics",
+    "car_foundation",
+    "car_planner",
+    "car_collect",
+    "car_dataset",
+    "car_ros2",
+]
+
+[tool.uv.sources]
+car-dynamics = { workspace = true }
+car-foundation = { workspace = true }
+car-planner = { workspace = true }
+car-collect = { workspace = true }
+car-dataset = { workspace = true }
+car-ros2 = { workspace = true }
